@@ -1,0 +1,119 @@
+// ─────────────────────────────────────────────────────────────
+var START  = '2017-06-01';
+var END    = '2017-07-31';
+
+// Shelby Co., TN  (pulled from TIGER counties)
+var shelby = ee.FeatureCollection('TIGER/2018/Counties')
+                .filter(ee.Filter.and(
+                  ee.Filter.eq('NAME', 'Shelby'),
+                  ee.Filter.eq('STATEFP', '47')
+                ))
+                .geometry();
+Map.centerObject(shelby, 9);
+
+// ─────────────────────────────────────────────────────────────
+// Helper: QA‑based cloud/shadow mask  (bits 3, 4, 5 & 7)
+// ─────────────────────────────────────────────────────────────
+function maskL8 (img) {
+  var qa = img.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(1 << 3).eq(0)    // clouds
+              .and( qa.bitwiseAnd(1 << 4).eq(0) ) // cloud shadow
+              .and( qa.bitwiseAnd(1 << 5).eq(0) ) // snow
+              .and( qa.bitwiseAnd(1 << 7).eq(0) );// cirrus
+  return img.updateMask(mask);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Per‑image processing: NDVI → emissivity → BT → LST
+// ─────────────────────────────────────────────────────────────
+function addLST (img) {
+  // NDVI (scaled SR bands already carry scale factors in GEE)
+  var ndvi = img.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+
+  // Proportion of vegetation, use NDVI thresholds 0.2–0.5
+  var pv   = ndvi.subtract(0.2).divide(0.5 - 0.2).clamp(0,1)
+                 .pow(2);                         // square, per Sobrino et al.
+
+  // Emissivity ε = 0.004·pv + 0.986
+  var emiss = pv.multiply(0.004).add(0.986).rename('EMIS');
+
+  // Brightness Temperature, Kelvin
+  var bt = img.select('ST_B10')
+              .multiply(0.00341802)   // scale factor
+              .add(149.0)             // add‑offset
+              .rename('BT');
+
+  // LST (λ = 10.895 µm, ρ = h·c/κ = 1.438×10⁻² m · K)
+  var lst = bt.expression(
+    'BT / (1 + (LAMBDA * BT / RHO) * log(EM))',
+    {
+      BT : bt,
+      EM : emiss,
+      LAMBDA : 10.895e-6,   // ← ASCII minus
+      RHO    : 1.438e-2     // ← ASCII minus
+    }
+  ).rename('LST');
+
+  return img.addBands([ndvi, emiss, bt, lst]);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Grab the imagery and run the pipeline
+// ─────────────────────────────────────────────────────────────
+var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+            .filterDate(START, END)
+            .filterBounds(shelby)
+            .filter(ee.Filter.lt('CLOUD_COVER', 20))   // be flexible
+            .map(maskL8)
+            .map(addLST);
+
+// ─────────────────────────────────────────────────────────────
+// Composites & visualisation
+// ─────────────────────────────────────────────────────────────
+var ndviVis = {min:0, max:1, palette:['white','green']};
+var lstVis  = {min:290, max:320,
+               palette:['blue','green','yellow','orange','red']};
+
+var ndviMean = l8.select('NDVI').mean().clip(shelby);
+var  lstMean = l8.select('LST' ).mean().clip(shelby);
+
+Map.addLayer(ndviMean, ndviVis, 'Mean NDVI (Jun-Jul 2017)');
+Map.addLayer(lstMean , lstVis , 'Mean LST  (Jun-Jul 2017)');
+
+// ─────────────────────────────────────────────────────────────
+// Optional context layers: DEM + hillshade
+// ─────────────────────────────────────────────────────────────
+var dem       = ee.Image('USGS/SRTMGL1_003').clip(shelby);
+var hillshade = ee.Terrain.hillshade(dem);
+
+Map.addLayer(dem,       {min:0,max:300,palette:['white','gray','black']}, 'DEM');
+Map.addLayer(hillshade, {min:0,max:255, opacity:0.5},                   'Hillshade');
+
+// ─────────────────────────────────────────────────────────────
+//  EXPORTS ── save mean NDVI, mean LST, DEM and Hillshade
+// ─────────────────────────────────────────────────────────────
+var outCRS   = 'EPSG:32616';   // UTM zone 16 N  (Memphis)
+// Landsat & SRTM are 30 m; pick whatever scale you need
+var outScale = 30;            
+
+// Helper: create a description and fileName with the same stem
+function makeExport(img, desc){
+  Export.image.toDrive({
+    image        : img,
+    description  : desc,          // task name
+    fileNamePrefix: desc,         // .tif in Drive
+    folder       : 'GEE_exports', // <- change if you like
+    region       : shelby,
+    scale        : outScale,
+    crs          : outCRS,
+    maxPixels    : 1e13
+  });
+}
+
+// Mean composites (already clipped)
+makeExport(ndviMean,  'Shelby_mean_NDVI_2017su');
+makeExport(lstMean ,  'Shelby_mean_LST_2017su');
+
+// DEM & hillshade (clip first)
+makeExport(dem      , 'Shelby_SRTM_DEM');
+makeExport(hillshade, 'Shelby_SRTM_Hillshade');
